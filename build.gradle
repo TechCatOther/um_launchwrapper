@@ -1,0 +1,176 @@
+import org.gradle.api.internal.artifacts.publish.ArchivePublishArtifact
+import org.gradle.api.internal.java.JavaLibrary
+
+apply plugin: 'java'
+apply plugin: 'maven-publish'
+
+sourceCompatibility = '1.6'
+targetCompatibility = '1.6'
+
+compileJava.options.encoding = 'UTF-8'
+if(compile_incremental == "true")
+	compileJava.options.incremental = true
+
+ext.commit = null
+ext.previousCommit = null
+ext.versionFile = null
+ext.revision = 0
+group = project_group
+version = computeVersion()
+
+repositories {
+	maven {
+		name 'forge'
+		url 'http://files.minecraftforge.net/maven'
+	}
+	mavenCentral()
+	maven {
+		name 'sonatypeSnapshot'
+		url 'https://oss.sonatype.org/content/repositories/snapshots/'
+	}
+	maven {
+		name 'minecraft'
+		url 'https://libraries.minecraft.net/'
+	}
+}
+
+dependencies {
+	compile 'org.lwjgl.lwjgl:lwjgl:2.9.1'
+	compile 'org.apache.logging.log4j:log4j-api:2.0-beta9'
+	compile 'org.apache.logging.log4j:log4j-core:2.0-beta9'
+	compile 'org.ow2.asm:asm-debug-all:5.0.3'
+	compile 'net.sf.jopt-simple:jopt-simple:4.5'
+}
+
+task jar_source(type: Jar) {
+	from sourceSets.main.allSource
+	classifier = 'sources'
+}
+
+task storeLastRevision {
+	inputs.property("version", version)
+	outputs.dir file("$buildDir/versions")
+	doLast {
+		doStoreLastRevision()
+	}
+}
+tasks.build.dependsOn tasks.storeLastRevision
+
+task changelog {
+	inputs.property("prev_commit", previousCommit)
+	inputs.property("commit", commit)
+	ext.changelogFile = file("$buildDir/libs/$project.name-$version-changelog.txt")
+	outputs.file changelogFile
+	doLast {
+		doGenerateChangelog(changelogFile);
+	}
+}
+
+artifacts {
+	archives jar_source
+}
+
+tasks.publish.dependsOn changelog
+publishing {
+	publications {
+		mavenDevJar(MavenPublication) {
+			from components.java
+			artifact tasks.jar_source
+			artifact tasks.changelog.getProperty('changelogFile'), {classifier = 'changelog'}
+		}
+	}
+	repositories {
+		if(project.hasProperty('publish_url') && !publish_url.isEmpty())
+			maven {
+				url publish_url
+			}
+	}
+}
+
+task dumpLibs(type: Copy) {
+	into "$buildDir/libs/libraries"
+	from configurations.runtime
+}
+
+String getGitDesc() {
+	def stdout = new ByteArrayOutputStream()
+	exec {
+		commandLine 'git', 'describe', '--tags', '--long'
+		standardOutput = stdout
+		errorOutput = stdout
+	}.rethrowFailure().assertNormalExitValue()
+	return stdout.toString().trim()
+}
+
+String computeVersion() {
+	if(project.hasProperty('override_version'))
+		return override_version
+
+	String mmversion; // major.minor
+	try {
+		String[] parts = getGitDesc().split('-')
+		if(parts.length != 3) throw new GradleException('no git tags found')
+		if(!parts[0].startsWith('v')) throw new GradleException('last git tag is not a version')
+		mmversion = parts[0].substring(1) //removing 'v'
+		commit = parts[2].substring(1) //removing 'g'
+	} catch (Exception e) {
+		if(release_type != 'indev') throw e
+		return 'indev'
+	}
+
+	if(release_type != 'stable') {
+		int ind = mmversion.lastIndexOf('.')
+		mmversion = mmversion.substring(0, ind+1) + ((mmversion.substring(ind+1) as int) + 1) + '.0-' + release_type
+	}
+
+	if(project.hasProperty('override_revision')) {
+		revision = override_revision as int
+	} else if(release_type != 'indev' || project.hasProperty('increment_revision')) {
+		File verfile = versionFile = file("$buildDir/versions/$mmversion")
+		String filetext;
+		if(verfile.exists() && !(filetext = verfile.getText().trim()).isEmpty()) {
+			String[] fileparts = filetext.split(':')
+			if(fileparts.length != 2) throw new GradleException('Version file is corrupted: ' + verfile.getAbsolutePath())
+			revision = fileparts[1] as int;
+			previousCommit = fileparts[0];
+			if(!commit.equals(fileparts[0]) || project.hasProperty('increment_revision')) {
+				revision++;
+			}
+		}
+	}
+
+	return (revision > 0 || release_type == 'stable') ? (mmversion+'.'+revision) : mmversion;
+}
+
+void doStoreLastRevision() {
+	if(versionFile != null) {
+		versionFile.getParentFile().mkdirs()
+		versionFile.write(commit+':'+revision)
+		file("$buildDir/versions/versions").append(commit+':'+version+'\n');
+	}
+}
+
+void doGenerateChangelog(File file) {
+	BufferedWriter writer = file.newWriter();
+	writer.writeLine("Changelog for $name-$version");
+	if(previousCommit == null) {
+		writer.writeLine('\tempty');
+	} else {
+		def stdout = new ByteArrayOutputStream()
+		exec {
+			commandLine 'git', 'log', '--abbrev-commit', '--pretty=short', previousCommit + '..HEAD'
+			standardOutput = stdout
+			errorOutput = stdout
+		}.rethrowFailure().assertNormalExitValue()
+		for(String s : stdout.toString().trim().split('\n')) {
+			s = s.trim();
+			if(s.isEmpty() || s.startsWith('Author'))
+				continue;
+			if(s.startsWith('commit'))
+				writer.writeLine('\t' + s.substring(7) + ':');
+			else
+				writer.writeLine('\t\t' + s);
+		}
+	}
+	writer.close();
+}
